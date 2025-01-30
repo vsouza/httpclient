@@ -3,6 +3,7 @@ package httpclient
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -49,16 +50,26 @@ func (t *Transport) SetProxy(proxy func(*http.Request) (*url.URL, error)) *Trans
 func (t *Transport) SetDNSCache(keepAliveDuration time.Duration, refreshCacheTime time.Duration) *Transport {
 
 	r := &dnscache.Resolver{}
-	options := dnscache.ResolverRefreshOptions{}
-	options.ClearUnused = true
-	options.PersistOnFailure = false
+	options := dnscache.ResolverRefreshOptions{
+		ClearUnused:      true,
+		PersistOnFailure: false,
+	}
 	r.RefreshWithOptions(options)
+
+	stopTicker := make(chan struct{})
+	done := make(chan struct{})
 
 	go func() {
 		t := time.NewTicker(refreshCacheTime)
 		defer t.Stop()
-		for range t.C {
-			r.Refresh(true)
+		for {
+			select {
+			case <-t.C:
+				r.Refresh(true)
+			case <-stopTicker:
+				close(done)
+				return
+			}
 		}
 	}()
 
@@ -77,15 +88,23 @@ func (t *Transport) SetDNSCache(keepAliveDuration time.Duration, refreshCacheTim
 			KeepAlive: keepAliveDuration,
 		}
 
+		var lastErr error
 		for _, ip := range ips {
 			conn, err = dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
 			if err == nil {
 				return conn, nil
 			}
+			lastErr = fmt.Errorf("failed to connect to %s: %w", net.JoinHostPort(ip, port), err)
 		}
 
-		return nil, err
+		return nil, fmt.Errorf("all attempts to connect to %s failed: %w", addr, lastErr)
 	}
+
+	defer func() {
+		close(stopTicker)
+		<-done
+	}()
+
 	return t
 }
 
